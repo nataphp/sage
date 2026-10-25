@@ -1,0 +1,39 @@
+{
+    "name": "nataphp/sage",
+    "description": "Multi-provider LLM actions (Claude, OpenAI, Gemini) for NataPHP",
+    "type": "nataphp-plugin",
+    "license": "MIT",
+    "homepage": "https://github.com/nataphp/sage",
+    "authors": [
+        {
+            "name": "Sérgio Dinis Lopes",
+            "homepage": "https://github.com/sergiodlopes"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-fileinfo": "*",
+        "nataphp/core": "^1.0"
+    },
+    "suggest": {
+        "ext-gd": "Shrinks image attachments before sending them",
+        "ext-exif": "Applies the EXIF orientation of JPEG attachments"
+    },
+    "autoload": {
+        "psr-4": {
+            "Sage\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Sage\Test\\": "tests/"
+        }
+    },
+    "extra": {
+        "nataphp": {
+            "bootstrap": true,
+            "routes": false
+        }
+    }
+}
