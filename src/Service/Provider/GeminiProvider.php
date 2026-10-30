@@ -87,9 +87,12 @@ final class GeminiProvider extends AbstractHttpProvider {
  * @throws \Sage\Service\Exception\LLMRateLimitedException On HTTP 429.
  * @throws \Sage\Service\Exception\LLMRefusalException When the answer is blocked.
  * @throws \Sage\Service\Exception\LLMProviderException On other errors or an empty answer.
- * @throws \Sage\Service\Exception\LLMValidationException On an unsupported attachment.
+ * @throws \Sage\Service\Exception\LLMValidationException On an unsupported attachment or server tools (Claude only).
  */
     public function complete(CompletionRequest $request): CompletionResponse {
+        if ($request->tools !== []) {
+            throw new LLMValidationException('Server tools (web_search, web_fetch) are only supported on Claude.', 0, null, ['provider' => 'gemini']);
+        }
         $parts = [['text' => $request->user_prompt]];
         foreach ($request->attachments as $attachment) {
             if (!in_array($attachment->mime, self::INLINE_MIMES, true)) {

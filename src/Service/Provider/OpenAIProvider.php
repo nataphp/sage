@@ -53,9 +53,12 @@ final class OpenAIProvider extends AbstractHttpProvider {
  * @throws \Sage\Service\Exception\LLMRateLimitedException On HTTP 429.
  * @throws \Sage\Service\Exception\LLMRefusalException When the model declines.
  * @throws \Sage\Service\Exception\LLMProviderException On other errors or an empty answer.
- * @throws \Sage\Service\Exception\LLMValidationException On an unsupported attachment.
+ * @throws \Sage\Service\Exception\LLMValidationException On an unsupported attachment or server tools (Claude only).
  */
     public function complete(CompletionRequest $request): CompletionResponse {
+        if ($request->tools !== []) {
+            throw new LLMValidationException('Server tools (web_search, web_fetch) are only supported on Claude.', 0, null, ['provider' => 'openai']);
+        }
         $messages = [];
         if ($request->system_prompt !== '') {
             $messages[] = ['role' => 'system', 'content' => $request->system_prompt];

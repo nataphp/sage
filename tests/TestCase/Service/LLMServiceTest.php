@@ -254,6 +254,30 @@ class LLMServiceTest extends TestCase {
     }
 
 /**
+ * The tools option (action defaults or run options) reaches the request,
+ * and the sources and tool errors reach the result.
+ *
+ * @return void
+ */
+    public function testServerToolsOption(): void {
+        $service = $this->_service(['echo' => ['class' => EchoTextAction::class, 'defaults' => ['tools' => ['web_search']]]], 'echo');
+        $this->_transport->queueJson(200, [
+            'stop_reason' => 'end_turn',
+            'content' => [
+                ['type' => 'web_search_tool_result', 'tool_use_id' => 's1', 'content' => [['type' => 'web_search_result', 'url' => 'https://a.test', 'title' => 'A']]],
+                ['type' => 'web_fetch_tool_result', 'tool_use_id' => 's2', 'content' => ['type' => 'web_fetch_tool_result_error', 'error_code' => 'url_not_accessible']],
+                ['type' => 'text', 'text' => 'ok'],
+            ],
+        ]);
+
+        $result = $service->run(['text' => 'x'], ['tools' => ['web_search', 'web_fetch']]);
+
+        $this->assertSame(['web_search', 'web_fetch'], array_column($this->_transport->lastPayload()['tools'], 'name'));
+        $this->assertSame([['tool' => 'web_search', 'url' => 'https://a.test', 'title' => 'A']], $result->sources);
+        $this->assertSame([['tool' => 'web_fetch', 'error_code' => 'url_not_accessible']], $result->tool_errors);
+    }
+
+/**
  * Missing input and bad attachments fail before any request.
  *
  * @return void

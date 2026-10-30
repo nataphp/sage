@@ -9,6 +9,7 @@ namespace Sage\Test\TestCase\Provider;
 use PHPUnit\Framework\TestCase;
 use Sage\Service\Dto\CompletionRequest;
 use Sage\Service\Exception\LLMRefusalException;
+use Sage\Service\Exception\LLMValidationException;
 use Sage\Service\Provider\GeminiProvider;
 use Sage\Service\Transport\FakeHttpTransport;
 
@@ -84,6 +85,16 @@ class GeminiProviderTest extends TestCase {
 
         $this->expectException(LLMRefusalException::class);
         (new GeminiProvider($transport, 'secret', GeminiProvider::DEFAULT_BASE_URL, false))->complete(new CompletionRequest('', 'Q', 'gemini', 'gemini-x'));
+    }
+
+/**
+ * Server tools are Claude only: refused, never silently dropped.
+ *
+ * @return void
+ */
+    public function testServerToolsAreRefused(): void {
+        $this->expectException(LLMValidationException::class);
+        (new GeminiProvider(new FakeHttpTransport(), 'secret', GeminiProvider::DEFAULT_BASE_URL, false))->complete(new CompletionRequest('', 'Q', 'gemini', 'gemini-x', tools: ['web_search']));
     }
 
 }

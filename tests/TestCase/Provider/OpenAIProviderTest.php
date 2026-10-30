@@ -10,6 +10,7 @@ use PHPUnit\Framework\TestCase;
 use Sage\Service\Dto\Attachment;
 use Sage\Service\Dto\CompletionRequest;
 use Sage\Service\Exception\LLMRefusalException;
+use Sage\Service\Exception\LLMValidationException;
 use Sage\Service\Provider\OpenAIProvider;
 use Sage\Service\Transport\FakeHttpTransport;
 
@@ -64,6 +65,16 @@ class OpenAIProviderTest extends TestCase {
 
         $this->expectException(LLMRefusalException::class);
         (new OpenAIProvider($transport, 'key', OpenAIProvider::DEFAULT_BASE_URL))->complete(new CompletionRequest('', 'Q', 'openai', 'gpt-x'));
+    }
+
+/**
+ * Server tools are Claude only: refused, never silently dropped.
+ *
+ * @return void
+ */
+    public function testServerToolsAreRefused(): void {
+        $this->expectException(LLMValidationException::class);
+        (new OpenAIProvider(new FakeHttpTransport(), 'key', OpenAIProvider::DEFAULT_BASE_URL))->complete(new CompletionRequest('', 'Q', 'openai', 'gpt-x', tools: ['web_search']));
     }
 
 }

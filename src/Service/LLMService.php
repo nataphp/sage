@@ -44,7 +44,7 @@ final class LLMService {
  *
  * @var list<string>
  */
-    public const OPTIONS = ['provider', 'model', 'temperature', 'max_tokens', 'timeout_seconds', 'effort', 'attachments', 'image_max_edge'];
+    public const OPTIONS = ['provider', 'model', 'temperature', 'max_tokens', 'timeout_seconds', 'effort', 'attachments', 'image_max_edge', 'tools'];
 
 /**
  * Constructor.
@@ -115,7 +115,8 @@ final class LLMService {
             (float)($this->_option('timeout_seconds', $options, $actionDefaults) ?? 30),
             $this->_attachments($options['attachments'] ?? [], (int)($this->_option('image_max_edge', $options, $actionDefaults) ?? ImagePreparer::DEFAULT_MAX_EDGE), $actionName),
             $jsonSchema,
-            $this->_option('effort', $options, $actionDefaults)
+            $this->_option('effort', $options, $actionDefaults),
+            (array)($this->_option('tools', $options, $actionDefaults) ?? [])
         );
 
         $logContext = ['scope' => ['sage'], 'action' => $actionName, 'provider' => $providerKey, 'model' => $request->model];
@@ -143,7 +144,7 @@ final class LLMService {
             'finish_reason' => $response->finish_reason,
         ] + $response->usage);
 
-        return new LLMResult($actionName, $providerKey, $response->model, $request->output_mode, $response->text, $json, $response->usage, $latency, $response->finish_reason);
+        return new LLMResult($actionName, $providerKey, $response->model, $request->output_mode, $response->text, $json, $response->usage, $latency, $response->finish_reason, $response->sources, $response->tool_errors);
     }
 
 /**

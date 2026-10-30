@@ -27,12 +27,26 @@ final class CompletionRequest {
  */
     public const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/**
+ * Server tools a request may ask for (run by the provider, not by the app).
+ *
+ * @var list<string>
+ */
+    public const SERVER_TOOLS = ['web_search', 'web_fetch'];
+
     public readonly string $system_prompt;
     public readonly string $user_prompt;
     public readonly string $provider;
     public readonly string $model;
     public readonly string $output_mode;
     public readonly ?string $effort;
+
+/**
+ * Server tools, each `['name' => 'web_search'|'web_fetch'] + its settings`.
+ *
+ * @var list<array<string, mixed>>
+ */
+    public readonly array $tools;
 
 /**
  * Constructor.
@@ -50,8 +64,10 @@ final class CompletionRequest {
  * @param array<string, mixed>|null $json_schema Full JSON Schema for native structured
  *   output (JSON mode only); null falls back to the provider's plain JSON mode.
  * @param string|null $effort Reasoning effort (see EFFORT_LEVELS); null leaves the provider default.
+ * @param list<string|array<string, mixed>> $tools Server tools (see SERVER_TOOLS): a name, or
+ *   `['name' => ..., ...settings]` (e.g. max_uses, allowed_domains).
  * @throws \Sage\Service\Exception\LLMValidationException On an empty provider/model, an
- *   unknown output mode or effort, a timeout <= 0 or a non-Attachment attachment.
+ *   unknown output mode, effort or tool, a timeout <= 0 or a non-Attachment attachment.
  */
     public function __construct(
         string $system_prompt,
@@ -64,7 +80,8 @@ final class CompletionRequest {
         public readonly float $timeout_seconds = 30.0,
         public readonly array $attachments = [],
         public readonly ?array $json_schema = null,
-        ?string $effort = null
+        ?string $effort = null,
+        array $tools = []
     ) {
         $this->system_prompt = trim($system_prompt);
         $this->user_prompt = trim($user_prompt);
@@ -72,6 +89,7 @@ final class CompletionRequest {
         $this->model = trim($model);
         $this->output_mode = strtolower(trim($output_mode));
         $this->effort = $effort !== null && $effort !== '' ? strtolower(trim($effort)) : null;
+        $this->tools = self::_normalizeTools($tools);
 
         if ($this->provider === '') {
             throw new LLMValidationException('provider is required.');
@@ -102,6 +120,29 @@ final class CompletionRequest {
  */
     public function wantsJson(): bool {
         return $this->output_mode === self::OUTPUT_MODE_JSON;
+    }
+
+/**
+ * Server tools as `['name' => ..., ...settings]`, each known and given once.
+ *
+ * @param list<string|array<string, mixed>> $tools Tools as given.
+ * @return list<array<string, mixed>>
+ * @throws \Sage\Service\Exception\LLMValidationException On an unknown or repeated tool.
+ */
+    private static function _normalizeTools(array $tools): array {
+        $normalized = [];
+        foreach ($tools as $tool) {
+            $tool = is_string($tool) ? ['name' => $tool] : $tool;
+            $name = is_array($tool) ? strtolower(trim((string)($tool['name'] ?? ''))) : '';
+            if (!in_array($name, self::SERVER_TOOLS, true)) {
+                throw new LLMValidationException('Unknown server tool.', 0, null, ['tool' => $name, 'accepted' => self::SERVER_TOOLS]);
+            }
+            if (isset($normalized[$name])) {
+                throw new LLMValidationException('Server tool given twice.', 0, null, ['tool' => $name]);
+            }
+            $normalized[$name] = ['name' => $name] + $tool;
+        }
+        return array_values($normalized);
     }
 
 }

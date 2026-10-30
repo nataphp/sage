@@ -6,9 +6,10 @@ Multi-provider LLM plugin for NataPHP. An **action** class describes one task (p
 - Attachments (images, PDF, text, audio/video on Gemini) from any Nata store; images are shrunk and EXIF-rotated before sending.
 - Retries with a backoff when the provider is busy (429, 529), one retry on timeouts and other 5xx; typed exceptions for rate limits, refusals and invalid output.
 - Several calls at once from PHP Fibers (one cURL multi handle; see "Concurrent calls").
+- Server tools on Claude: web search and web fetch run on Anthropic's side within the same call (see "Server tools").
 - Logging with token usage; fully testable with a fake HTTP transport.
 
-No tool calling or streaming: one request, one answer.
+No client-side tool calling or streaming: one request, one answer (server tools included).
 
 ---
 
@@ -95,6 +96,7 @@ Accepted as action `defaults`, by `Sage::for($action, $options)` and by `run($in
 | `timeout_seconds` | HTTP timeout. |
 | `attachments` | List of `Nata\FilesystemManager\File` or `Sage\Service\Dto\Attachment`. Run options only. |
 | `image_max_edge` | Long-edge limit for image attachments (0 = untouched). |
+| `tools` | Server tools, Claude only: `web_search`, `web_fetch` (see "Server tools"). |
 
 Resolution: `run()` options → `Sage::for()` options → action `defaults` → global config.
 
@@ -141,7 +143,7 @@ $result = Sage::run('invoice.extract', [], ['attachments' => [$file]]);
 $result = Sage::run('text.check', [], ['attachments' => [Attachment::fromBytes($csv, 'text/csv')]]);
 ```
 
-`LLMResult`: `action`, `provider`, `model`, `output_mode`, `text`, `json`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`, best effort), `latency_ms`, `finish_reason`.
+`LLMResult`: `action`, `provider`, `model`, `output_mode`, `text`, `json`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`, best effort; `web_search_requests`, `web_fetch_requests` with server tools), `latency_ms`, `finish_reason`, `sources` and `tool_errors` (server tools).
 
 ### Attachments
 
@@ -158,6 +160,29 @@ Backend-injected only: load the file after checking the user may see it; never a
 
 JPEG, PNG and WebP larger than `images.maxEdge` are resampled (same format); JPEGs get their EXIF orientation applied first, since re-encoding drops the tag. Phone photos shrink from several MB to a few hundred KB, which also keeps them under Claude's 5 MB limit. Needs `ext-gd` (and `ext-exif` for the orientation); without them images are sent as they are.
 
+### Server tools (Claude)
+
+`tools` lets a Claude action search and read the web on Anthropic's side, within the same `run()`: `web_search` and `web_fetch` (the `_20260209` versions, with dynamic filtering; Claude Opus 4.6+ and Sonnet 4.6+). Each tool is a name or a name with its settings:
+
+```php
+'municipal.find_source' => ['defaults' => [
+    'provider' => 'claude',
+    'effort' => 'medium',
+    'timeout_seconds' => 240,
+    'tools' => [
+        ['name' => 'web_search', 'max_uses' => 4, 'allowed_domains' => ['example.pt']],
+        ['name' => 'web_fetch', 'max_uses' => 3, 'max_content_tokens' => 20000],
+    ],
+]],
+```
+
+Settings go to the API as they are (`max_uses`, `allowed_domains` or `blocked_domains`, `user_location`, `max_content_tokens`, `citations`); `type` overrides the version (e.g. `web_search_20250305` for older models). Web fetch only opens URLs already in the conversation (the prompt or earlier results).
+
+- **Long turns.** When the server loop pauses (`stop_reason: pause_turn`), Sage sends the paused assistant turn back unchanged and resumes, up to `ClaudeProvider::MAX_CONTINUATIONS` (5) times; a turn still paused after that ends with `finish_reason` `pause_turn`.
+- **Result.** `text` (and `json`) as usual; `sources` lists the pages returned (`tool`, `url`, and `title`, `page_age`, `retrieved_at` when given); `tool_errors` the calls that failed (`tool`, `error_code`, e.g. `max_uses_exceeded`, `url_not_accessible`): the model saw the error and went on. `usage` adds `web_search_requests` and `web_fetch_requests`.
+- **Prompt.** At low effort the model may answer without searching: say in the system prompt to search first and never answer from memory.
+- **Cost.** Web search is billed per search (on top of tokens); web fetch only by the tokens it adds. Every search result and fetched page is input to the following steps, so a turn with a few searches easily reads 100k+ input tokens: cap them with `max_uses` and `max_content_tokens`.
+- OpenAI and Gemini throw `LLMValidationException` for `tools` (never silently dropped).
 ## Concurrent calls
 
 The default transport, `CurlMultiTransport`, keeps one cURL multi handle for the process (`LLMFactory::transport()`). A call made outside a Fiber waits for its answer, as usual. A call made inside a Fiber suspends the Fiber until its answer is in, and so do the pauses between retries. The loop that runs the Fibers calls `poll()` and resumes them:
@@ -187,7 +212,7 @@ All extend `Sage\Service\Exception\LLMException`, with a `context()` array for l
 
 | Exception | When | Retried | Suggested HTTP |
 |---|---|---|---|
-| `LLMValidationException` | bad input, unknown action/provider, unsupported attachment, invalid or truncated JSON | no | 422 |
+| `LLMValidationException` | bad input, unknown action/provider/server tool, unsupported attachment, server tools on OpenAI/Gemini, invalid or truncated JSON | no | 422 |
 | `LLMRefusalException` | the model or safety filters declined (`context()['category']`) | no | 422 |
 | `LLMRateLimitedException` | HTTP 429 (`context()['retry_after']`) | up to `rateLimitRetries`, backoff | 429 |
 | `LLMTimeoutException` | timeout or network error | once | 504 |

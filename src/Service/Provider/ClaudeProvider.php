@@ -31,6 +31,13 @@ use Sage\Service\Transport\HttpTransportInterface;
  *
  * Optional `fallbacks` ('default' or a list of `['model' => ...]`): server-side
  * fallback to another model when the requested one declines (beta).
+ *
+ * Server tools (`tools` option: web_search, web_fetch) run on Anthropic's side
+ * within the same call. When the server loop pauses (`stop_reason:
+ * pause_turn`) the paused assistant turn is sent back unchanged to resume it,
+ * up to MAX_CONTINUATIONS times. The text joins the text blocks of every
+ * part; the pages returned go to `sources`, failed tool calls to
+ * `tool_errors`, and the number of searches and fetches to `usage`.
  */
 final class ClaudeProvider extends AbstractHttpProvider {
 
@@ -48,6 +55,19 @@ final class ClaudeProvider extends AbstractHttpProvider {
  * @var list<string>
  */
     public const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+/**
+ * Type of each server tool (the dynamic-filtering versions; a tool's `type`
+ * setting overrides it, e.g. web_search_20250305 for older models).
+ *
+ * @var array<string, string>
+ */
+    public const SERVER_TOOL_TYPES = ['web_search' => 'web_search_20260209', 'web_fetch' => 'web_fetch_20260209'];
+
+/**
+ * Most times a paused server-tool turn (`pause_turn`) is resumed.
+ */
+    public const MAX_CONTINUATIONS = 5;
 
 /**
  * Provider name used in exception messages.
@@ -113,6 +133,9 @@ final class ClaudeProvider extends AbstractHttpProvider {
         if ($outputConfig !== []) {
             $payload['output_config'] = $outputConfig;
         }
+        if ($request->tools !== []) {
+            $payload['tools'] = array_map(fn(array $tool) => $this->_serverTool($tool), $request->tools);
+        }
 
         $headers = [
             'x-api-key' => $this->apiKey,
@@ -123,26 +146,53 @@ final class ClaudeProvider extends AbstractHttpProvider {
             $headers['anthropic-beta'] = is_string($this->fallbacks) ? 'server-side-fallback-2026-07-01' : 'server-side-fallback-2026-06-01';
         }
 
-        $data = $this->_postJson($this->baseUrl . '/messages', $payload, $headers, $request->timeout_seconds);
+        // Every part of the turn: one, or more when a server-tool turn pauses.
+        $blocks = [];
+        $promptTokens = null;
+        $completionTokens = null;
+        $serverToolUse = [];
+        $continuations = 0;
+        while (true) {
+            $data = $this->_postJson($this->baseUrl . '/messages', $payload, $headers, $request->timeout_seconds);
 
-        $stopReason = isset($data['stop_reason']) ? (string)$data['stop_reason'] : null;
-        if ($stopReason === 'refusal') {
-            throw new LLMRefusalException('Claude declined the request.', 0, null, [
-                'category' => $data['stop_details']['category'] ?? null,
-                'explanation' => $data['stop_details']['explanation'] ?? null,
-            ]);
+            $stopReason = isset($data['stop_reason']) ? (string)$data['stop_reason'] : null;
+            if ($stopReason === 'refusal') {
+                throw new LLMRefusalException('Claude declined the request.', 0, null, [
+                    'category' => $data['stop_details']['category'] ?? null,
+                    'explanation' => $data['stop_details']['explanation'] ?? null,
+                ]);
+            }
+
+            $content = array_values(array_filter((array)($data['content'] ?? []), 'is_array'));
+            $blocks = array_merge($blocks, $content);
+
+            $usage = $data['usage'] ?? [];
+            if (isset($usage['input_tokens'])) {
+                $promptTokens = (int)$promptTokens + (int)$usage['input_tokens'] + (int)($usage['cache_read_input_tokens'] ?? 0) + (int)($usage['cache_creation_input_tokens'] ?? 0);
+            }
+            if (isset($usage['output_tokens'])) {
+                $completionTokens = (int)$completionTokens + (int)$usage['output_tokens'];
+            }
+            foreach ((array)($usage['server_tool_use'] ?? []) as $counter => $count) {
+                $serverToolUse[$counter] = ($serverToolUse[$counter] ?? 0) + (int)$count;
+            }
+
+            if ($stopReason !== 'pause_turn' || $continuations >= self::MAX_CONTINUATIONS) {
+                break;
+            }
+            // Resume: the paused assistant turn goes back unchanged (with the
+            // encrypted search results), never with an extra user message.
+            $continuations++;
+            $payload['messages'] = [$payload['messages'][0], ['role' => 'assistant', 'content' => $blocks]];
         }
 
         $text = '';
-        foreach ((array)($data['content'] ?? []) as $block) {
-            if (is_array($block) && ($block['type'] ?? null) === 'text') {
+        foreach ($blocks as $block) {
+            if (($block['type'] ?? null) === 'text') {
                 $text .= (string)($block['text'] ?? '');
             }
         }
-
-        $usage = $data['usage'] ?? [];
-        $promptTokens = isset($usage['input_tokens']) ? (int)$usage['input_tokens'] + (int)($usage['cache_read_input_tokens'] ?? 0) + (int)($usage['cache_creation_input_tokens'] ?? 0) : null;
-        $completionTokens = $usage['output_tokens'] ?? null;
+        [$sources, $toolErrors] = $this->_toolResults($blocks);
 
         return new CompletionResponse(
             $text,
@@ -150,10 +200,68 @@ final class ClaudeProvider extends AbstractHttpProvider {
             $this->_usage([
                 'prompt_tokens' => $promptTokens,
                 'completion_tokens' => $completionTokens,
-                'total_tokens' => $promptTokens !== null && $completionTokens !== null ? $promptTokens + (int)$completionTokens : null,
+                'total_tokens' => $promptTokens !== null && $completionTokens !== null ? $promptTokens + $completionTokens : null,
+                'web_search_requests' => $serverToolUse['web_search_requests'] ?? null,
+                'web_fetch_requests' => $serverToolUse['web_fetch_requests'] ?? null,
             ]),
-            $stopReason
+            $stopReason,
+            $sources,
+            $toolErrors
         );
+    }
+
+/**
+ * Definition of one server tool for the Messages API.
+ *
+ * @param array<string, mixed> $tool `['name' => ..., ...settings]` (CompletionRequest).
+ * @return array<string, mixed>
+ */
+    protected function _serverTool(array $tool): array {
+        $name = (string)$tool['name'];
+        unset($tool['name']);
+
+        return ['type' => (string)($tool['type'] ?? self::SERVER_TOOL_TYPES[$name]), 'name' => $name] + $tool;
+    }
+
+/**
+ * Pages returned by the server tools, and their failed calls.
+ *
+ * A search result block holds a list of results, or one error object; a
+ * fetch result block holds the fetched page, or one error object.
+ *
+ * @param list<array<string, mixed>> $blocks Content blocks of the turn.
+ * @return array{0: list<array<string, string>>, 1: list<array{tool: string, error_code: string}>} Sources and errors.
+ */
+    protected function _toolResults(array $blocks): array {
+        $sources = [];
+        $errors = [];
+        foreach ($blocks as $block) {
+            $type = $block['type'] ?? null;
+            if ($type !== 'web_search_tool_result' && $type !== 'web_fetch_tool_result') {
+                continue;
+            }
+            $tool = $type === 'web_search_tool_result' ? 'web_search' : 'web_fetch';
+            $content = $block['content'] ?? [];
+            if (is_array($content) && isset($content['error_code'])) {
+                $errors[] = ['tool' => $tool, 'error_code' => (string)$content['error_code']];
+                continue;
+            }
+            $results = $tool === 'web_search' ? (array)$content : [$content];
+            foreach ($results as $result) {
+                if (!is_array($result) || !isset($result['url'])) {
+                    continue;
+                }
+                $source = ['tool' => $tool, 'url' => (string)$result['url']];
+                foreach (['title', 'page_age', 'retrieved_at'] as $field) {
+                    if (isset($result[$field])) {
+                        $source[$field] = (string)$result[$field];
+                    }
+                }
+                $sources[] = $source;
+            }
+        }
+
+        return [$sources, $errors];
     }
 
 /**
