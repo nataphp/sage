@@ -29,6 +29,7 @@ final class CompletionResponse {
  * @param string|null $finish_reason Provider's raw stop/finish reason.
  * @param list<array{tool: string, url: string, title?: string, page_age?: string, retrieved_at?: string}> $sources Pages the server tools returned (search results and fetched pages), in order.
  * @param list<array{tool: string, error_code: string}> $tool_errors Server tool calls that failed (the model saw the error and went on).
+ * @param int|null $first_token_ms Streams: milliseconds until the first piece of text.
  */
     public function __construct(
         public readonly string $text,
@@ -36,7 +37,8 @@ final class CompletionResponse {
         public readonly array $usage = [],
         public readonly ?string $finish_reason = null,
         public readonly array $sources = [],
-        public readonly array $tool_errors = []
+        public readonly array $tool_errors = [],
+        public readonly ?int $first_token_ms = null
     ) {
     }
 

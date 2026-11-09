@@ -35,7 +35,7 @@ use Fiber;
  * Network failures (timeout, DNS, TLS) come back as status 0 with the error,
  * never as exceptions, so providers can map them to LLMTimeoutException.
  */
-final class CurlMultiTransport implements HttpTransportInterface {
+final class CurlMultiTransport implements HttpTransportInterface, StreamingTransportInterface {
 
 /**
  * Seconds to connect.
@@ -79,6 +79,109 @@ final class CurlMultiTransport implements HttpTransportInterface {
         unset($this->_requests[$id]);
 
         return $response;
+    }
+
+/**
+ * Send a request and stream its response body (StreamingTransportInterface).
+ *
+ * Runs on a multi handle of its own, waiting on the network at most
+ * `tick_seconds` at a time, so `on_tick` is called on time even when nothing
+ * arrives (libcurl's progress callback only promises about once a second).
+ * It blocks until the transfer ends: not for use inside the Fibers of poll().
+ *
+ * @param string $method HTTP method.
+ * @param string $url Absolute URL.
+ * @param array<string, mixed> $options `header`, `body`, `timeout`, `on_tick`, `tick_seconds`.
+ * @param callable(string, float): bool $onData Receives each piece of a 2xx body.
+ * @return \Sage\Service\Transport\HttpTransportResponse
+ */
+    public function stream(string $method, string $url, array $options, callable $onData): HttpTransportResponse {
+        $onTick = isset($options['on_tick']) && is_callable($options['on_tick']) ? $options['on_tick'] : null;
+        $tick = max(0.01, (float)($options['tick_seconds'] ?? 0.05));
+        $started = microtime(true);
+        $status = 0;
+        $headers = [];
+        $errorBody = '';
+        $aborted = false;
+
+        $handle = curl_init();
+        $headerLines = [];
+        foreach ((array)($options['header'] ?? []) as $name => $value) {
+            $headerLines[] = $name . ': ' . $value;
+        }
+        $method = strtoupper(trim($method));
+        curl_setopt_array($handle, [
+            CURLOPT_URL => $url,
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_HTTPHEADER => $headerLines,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            // No compression: a compressed stream arrives in compressed blocks, not token by token.
+            CURLOPT_ENCODING => 'identity',
+            CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT,
+            CURLOPT_TIMEOUT_MS => (int)ceil(max(1.0, (float)($options['timeout'] ?? 30)) * 1000),
+            CURLOPT_HEADERFUNCTION => function (CurlHandle $curl, string $line) use (&$status, &$headers): int {
+                if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $match) === 1) {
+                    $status = (int)$match[1];
+                    $headers = [];
+                } else {
+                    $parts = explode(':', $line, 2);
+                    if (count($parts) === 2) {
+                        $headers[strtolower(trim($parts[0]))] = trim($parts[1]);
+                    }
+                }
+
+                return strlen($line);
+            },
+            CURLOPT_WRITEFUNCTION => function (CurlHandle $curl, string $bytes) use (&$status, &$errorBody, &$aborted, $onData, $started): int {
+                if ($status < 200 || $status >= 300) {
+                    $errorBody .= $bytes;
+
+                    return strlen($bytes);
+                }
+                if ($onData($bytes, microtime(true) - $started) === false) {
+                    $aborted = true;
+
+                    return 0;
+                }
+
+                return strlen($bytes);
+            },
+        ]);
+        if (isset($options['body']) && $method !== 'GET') {
+            curl_setopt($handle, CURLOPT_POSTFIELDS, (string)$options['body']);
+        }
+
+        $multi = curl_multi_init();
+        curl_multi_add_handle($multi, $handle);
+        $result = CURLE_OK;
+        do {
+            curl_multi_exec($multi, $running);
+            while (($info = curl_multi_info_read($multi)) !== false) {
+                if ($info['msg'] === CURLMSG_DONE) {
+                    $result = (int)$info['result'];
+                }
+            }
+            if ($aborted) {
+                break;
+            }
+            if ($onTick !== null && $onTick(microtime(true) - $started) === false) {
+                $aborted = true;
+                break;
+            }
+            if ($running > 0 && curl_multi_select($multi, $tick) === -1) {
+                usleep((int)($tick * 1000000));
+            }
+        } while ($running > 0);
+        curl_multi_remove_handle($multi, $handle);
+        curl_multi_close($multi);
+
+        if ($aborted) {
+            return new HttpTransportResponse($status, $headers, $errorBody, 'Aborted by the caller.', true);
+        }
+        $error = $result === CURLE_OK ? '' : (curl_strerror($result) ?: 'Transfer failed.');
+
+        return new HttpTransportResponse($status, $status > 0 ? $headers : [], $errorBody, $status > 0 ? $error : ($error ?: 'No response.'));
     }
 
 /**

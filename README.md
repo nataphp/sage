@@ -9,7 +9,9 @@ Multi-provider LLM plugin for NataPHP. An **action** class describes one task (p
 - Server tools on Claude: web search and web fetch run on Anthropic's side within the same call (see "Server tools").
 - Logging with token usage; fully testable with a fake HTTP transport.
 
-No client-side tool calling or streaming: one request, one answer (server tools included).
+- Streaming of the text on Claude, with a time limit to the first token (see "Streaming").
+
+No client-side tool calling.
 
 ---
 
@@ -97,6 +99,7 @@ Accepted as action `defaults`, by `Sage::for($action, $options)` and by `run($in
 | `attachments` | List of `Nata\FilesystemManager\File` or `Sage\Service\Dto\Attachment`. Run options only. |
 | `image_max_edge` | Long-edge limit for image attachments (0 = untouched). |
 | `tools` | Server tools, Claude only: `web_search`, `web_fetch` (see "Server tools"). |
+| `first_token_timeout_seconds` | Streams only: seconds allowed until the first piece of text (see "Streaming"). |
 
 Resolution: `run()` options → `Sage::for()` options → action `defaults` → global config.
 
@@ -183,6 +186,33 @@ Settings go to the API as they are (`max_uses`, `allowed_domains` or `blocked_do
 - **Prompt.** At low effort the model may answer without searching: say in the system prompt to search first and never answer from memory.
 - **Cost.** Web search is billed per search (on top of tokens); web fetch only by the tokens it adds. Every search result and fetched page is input to the following steps, so a turn with a few searches easily reads 100k+ input tokens: cap them with `max_uses` and `max_content_tokens`.
 - OpenAI and Gemini throw `LLMValidationException` for `tools` (never silently dropped).
+
+## Streaming
+
+`Sage::stream()` hands the text over as it is generated, for someone waiting in front of a screen (Claude only, text actions, no server tools):
+
+```php
+$result = Sage::stream('prophecy.generate', $input, function (string $delta): ?bool {
+    echo json_encode(['t' => $delta]) . "\n";
+    flush();
+
+    return null; // false stops the stream
+}, ['first_token_timeout_seconds' => 3, 'timeout_seconds' => 8]);
+$result->text;            // the whole text
+$result->first_token_ms;  // time to the first piece of text
+```
+
+- **Time limits**, from the start of the request: `first_token_timeout_seconds` until the first piece of text, `timeout_seconds` for the whole stream. They are checked about every 50 ms (the transport calls back even when nothing arrives), so a limit is kept to within a tick.
+- **No retries**: someone is waiting, and a retry would blow the limits.
+- **Before the first piece of text**, every failure is an ordinary exception: `LLMTimeoutException` (`context()['phase']`: `first_token`, `connect` or `total`), `LLMRateLimitedException`, `LLMProviderException` (an `overloaded_error` event comes as status 529), `LLMRefusalException`.
+- **After it**, a stream that does not end cleanly (time limit, dropped connection, an `error` event) throws `LLMStreamInterruptedException`: `partialText()` is what arrived (already given to the callback) and `context()['reason']` says why (`timeout`, `network`, `provider_error`, `incomplete`). A refusal still throws `LLMRefusalException`.
+- **Stopping**: when the callback returns `false` the transfer is aborted and the result has the text so far, with `finish_reason` `stopped` (e.g. the app read a first line that says to stop).
+- `LLMService::stream($input, $onText, $options)` is the same on a bound service. The option `first_token_timeout_seconds` also goes in the action's `defaults`.
+
+The transport must implement `StreamingTransportInterface` (`CurlMultiTransport` does: a multi handle of its own, no compression, blocking; not for use inside the Fibers of `poll()`). `FakeHttpTransport::queueStream()` plays a stream on a scripted clock and `queueEvents()` sends a list of events; a custom provider streams by implementing `StreamingProviderInterface`.
+
+To pass the pieces on to a browser, the web server must not buffer the response: `X-Accel-Buffering: no` (nginx), no compression on that route, no output buffering in PHP, and `flush()` after each piece.
+
 ## Concurrent calls
 
 The default transport, `CurlMultiTransport`, keeps one cURL multi handle for the process (`LLMFactory::transport()`). A call made outside a Fiber waits for its answer, as usual. A call made inside a Fiber suspends the Fiber until its answer is in, and so do the pauses between retries. The loop that runs the Fibers calls `poll()` and resumes them:
@@ -215,7 +245,8 @@ All extend `Sage\Service\Exception\LLMException`, with a `context()` array for l
 | `LLMValidationException` | bad input, unknown action/provider/server tool, unsupported attachment, server tools on OpenAI/Gemini, invalid or truncated JSON | no | 422 |
 | `LLMRefusalException` | the model or safety filters declined (`context()['category']`) | no | 422 |
 | `LLMRateLimitedException` | HTTP 429 (`context()['retry_after']`) | up to `rateLimitRetries`, backoff | 429 |
-| `LLMTimeoutException` | timeout or network error | once | 504 |
+| `LLMTimeoutException` | timeout or network error | once (streams: never) | 504 |
+| `LLMStreamInterruptedException` | a stream stopped after its first token (`partialText()`) | no | 502 |
 | `LLMProviderException` | other provider errors (`context()['status']`) | 529: like 429; other 5xx: once | 502 |
 
 Truncated JSON (the output hit `max_tokens`) throws `LLMValidationException` saying so, with `finish_reason` in the context.
@@ -241,10 +272,11 @@ The plugin's own tests are in `tests/TestCase` (no network, no database).
 ## Architecture
 
 ```
-Sage::run / Sage::for
+Sage::run / Sage::for / Sage::stream
   └ LLMFactory::build        config → ActionRegistry + providers (validates the action)
       └ LLMService::run      input check → options → Attachment + ImagePreparer
           → CompletionRequest → Provider::complete (retries) → JsonOutput::parse → LLMResult
+      └ LLMService::stream   → CompletionRequest → StreamingProvider::stream (SseParser, no retries) → LLMResult
 ```
 
 | Namespace | Contents |
@@ -255,8 +287,9 @@ Sage::run / Sage::for
 | `Sage\Service\Attachment` | `ImagePreparer` |
 | `Sage\Service\Dto` | `Attachment`, `CompletionRequest`, `CompletionResponse`, `LLMResult` |
 | `Sage\Service\Exception` | `LLMException` and subclasses |
-| `Sage\Service\Provider` | `ProviderInterface`, `AbstractHttpProvider`, `ClaudeProvider`, `OpenAIProvider`, `GeminiProvider` |
-| `Sage\Service\Transport` | `HttpTransportInterface`, `HttpTransportResponse`, `CurlMultiTransport` (default), `NataHttpTransport`, `FakeHttpTransport` |
+| `Sage\Service\Stream` | `SseParser` |
+| `Sage\Service\Provider` | `ProviderInterface`, `StreamingProviderInterface`, `AbstractHttpProvider`, `ClaudeProvider`, `OpenAIProvider`, `GeminiProvider` |
+| `Sage\Service\Transport` | `HttpTransportInterface`, `StreamingTransportInterface`, `HttpTransportResponse`, `CurlMultiTransport` (default), `NataHttpTransport`, `FakeHttpTransport` |
 
 ## Changes from the appontece version
 

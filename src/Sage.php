@@ -23,6 +23,9 @@ use Sage\Service\LLMService;
  *   }
  *
  *   $result = Sage::run('invoice.extract', [], ['attachments' => [$file]]);
+ *
+ *   $result = Sage::stream('story.tell', $input, function (string $delta) { echo $delta; flush(); },
+ *       ['first_token_timeout_seconds' => 3, 'timeout_seconds' => 8]);
  */
 final class Sage {
 
@@ -55,6 +58,22 @@ final class Sage {
             unset($input['attachments']);
         }
         return static::for($action, $options)->run($input);
+    }
+
+/**
+ * Build and stream in one call: the text goes to `$onText` as it is
+ * generated (see LLMService::stream()).
+ *
+ * @param string $action Action key (a text action).
+ * @param array<string, mixed> $input Action input.
+ * @param callable(string): (bool|null) $onText Receives each piece of text; false stops the stream.
+ * @param array<string, mixed> $options Per-call options, with `first_token_timeout_seconds`.
+ * @return \Sage\Service\Dto\LLMResult
+ * @throws \Sage\Service\Exception\LLMException On any Sage failure (LLMStreamInterruptedException
+ *   when the stream stopped after its first token).
+ */
+    public static function stream(string $action, array $input, callable $onText, array $options = []): LLMResult {
+        return static::for($action, $options)->stream($input, $onText);
     }
 
 }

@@ -22,6 +22,7 @@ use Sage\Service\Exception\LLMProviderException;
 use Sage\Service\Exception\LLMTimeoutException;
 use Sage\Service\Exception\LLMValidationException;
 use Sage\Service\Provider\ProviderInterface;
+use Sage\Service\Provider\StreamingProviderInterface;
 use Fiber;
 use Throwable;
 
@@ -44,7 +45,7 @@ final class LLMService {
  *
  * @var list<string>
  */
-    public const OPTIONS = ['provider', 'model', 'temperature', 'max_tokens', 'timeout_seconds', 'effort', 'attachments', 'image_max_edge', 'tools'];
+    public const OPTIONS = ['provider', 'model', 'temperature', 'max_tokens', 'timeout_seconds', 'effort', 'attachments', 'image_max_edge', 'tools', 'first_token_timeout_seconds'];
 
 /**
  * Constructor.
@@ -80,6 +81,105 @@ final class LLMService {
  * @throws \Sage\Service\Exception\LLMProviderException On other provider errors after the retry.
  */
     public function run(array $input, array $options = []): LLMResult {
+        [$actionName, $provider, $request, $outputSchema] = $this->_prepare($input, $options);
+        $providerKey = $request->provider;
+
+        $logContext = ['scope' => ['sage'], 'action' => $actionName, 'provider' => $providerKey, 'model' => $request->model];
+        $started = microtime(true);
+        try {
+            $response = $this->_complete($provider, $request);
+        } catch (LLMException $exception) {
+            Log::write('warning', 'Sage action failed: ' . $exception->getMessage(), $logContext + $exception->context());
+            throw $exception;
+        }
+        $latency = (int)round((microtime(true) - $started) * 1000);
+
+        $json = null;
+        if ($request->wantsJson()) {
+            $context = ['action' => $actionName, 'finish_reason' => $response->finish_reason];
+            if ($response->isTruncated() && JsonOutput::decode($response->text) === null) {
+                throw new LLMValidationException('Model output was truncated (token limit reached); raise max_tokens.', 0, null, $context);
+            }
+            $json = JsonOutput::parse($response->text, $outputSchema ?? [], $context);
+        }
+
+        Log::write('info', 'Sage action completed', $logContext + [
+            'model' => $response->model,
+            'latency_ms' => $latency,
+            'finish_reason' => $response->finish_reason,
+        ] + $response->usage);
+
+        return new LLMResult($actionName, $providerKey, $response->model, $request->output_mode, $response->text, $json, $response->usage, $latency, $response->finish_reason, $response->sources, $response->tool_errors);
+    }
+
+/**
+ * Run the bound action and hand its text to `$onText` as it is generated
+ * (text actions only, no server tools; the provider must implement
+ * StreamingProviderInterface: Claude does).
+ *
+ * No retries: a stream is for someone waiting, and a retry would blow the
+ * time limits. `timeout_seconds` limits the whole stream and
+ * `first_token_timeout_seconds` the wait for its first piece of text.
+ * `$onText(string $delta)` may return false to stop the stream (the result
+ * then has `finish_reason` 'stopped').
+ *
+ * @param array<string, mixed> $input Input; must contain the action's required keys.
+ * @param callable(string): (bool|null) $onText Receives each piece of text.
+ * @param array<string, mixed> $options Per-call options (see OPTIONS).
+ * @return \Sage\Service\Dto\LLMResult With `first_token_ms`.
+ * @throws \Sage\Service\Exception\LLMValidationException On bad input, a JSON action, server tools
+ *   or a provider that cannot stream.
+ * @throws \Sage\Service\Exception\LLMTimeoutException When nothing arrived in time.
+ * @throws \Sage\Service\Exception\LLMStreamInterruptedException When the stream stopped after its first
+ *   token (partialText() has what arrived).
+ * @throws \Sage\Service\Exception\LLMRefusalException When the model declines.
+ * @throws \Sage\Service\Exception\LLMProviderException On other provider errors.
+ */
+    public function stream(array $input, callable $onText, array $options = []): LLMResult {
+        [$actionName, $provider, $request] = $this->_prepare($input, $options);
+        $providerKey = $request->provider;
+        if ($request->wantsJson() || $request->tools !== []) {
+            throw new LLMValidationException('Streaming is for text actions, without server tools.', 0, null, ['action' => $actionName]);
+        }
+        if (!$provider instanceof StreamingProviderInterface) {
+            throw new LLMValidationException('This LLM provider cannot stream.', 0, null, ['action' => $actionName, 'provider' => $providerKey]);
+        }
+        $merged = array_merge($this->boundOptions, $options);
+        $entry = $this->registry->get($actionName);
+        $firstTokenTimeout = $this->_option('first_token_timeout_seconds', $merged, $entry['defaults']);
+
+        $logContext = ['scope' => ['sage'], 'action' => $actionName, 'provider' => $providerKey, 'model' => $request->model, 'stream' => true];
+        $started = microtime(true);
+        try {
+            $response = $provider->stream($request, $onText, $firstTokenTimeout !== null ? (float)$firstTokenTimeout : null);
+        } catch (LLMException $exception) {
+            $context = $exception->context();
+            unset($context['partial_text']);
+            Log::write('warning', 'Sage stream failed: ' . $exception->getMessage(), $logContext + $context);
+            throw $exception;
+        }
+        $latency = (int)round((microtime(true) - $started) * 1000);
+
+        Log::write('info', 'Sage stream completed', $logContext + [
+            'model' => $response->model,
+            'latency_ms' => $latency,
+            'first_token_ms' => $response->first_token_ms,
+            'finish_reason' => $response->finish_reason,
+        ] + $response->usage);
+
+        return new LLMResult($actionName, $providerKey, $response->model, $request->output_mode, $response->text, null, $response->usage, $latency, $response->finish_reason, [], [], $response->first_token_ms);
+    }
+
+/**
+ * Validate the input and resolve the action, the provider and the request.
+ *
+ * @param array<string, mixed> $input Input.
+ * @param array<string, mixed> $options Per-call options.
+ * @return array{0: string, 1: \Sage\Service\Provider\ProviderInterface, 2: \Sage\Service\Dto\CompletionRequest, 3: array<string, string>|null} Action key, provider, request and output schema.
+ * @throws \Sage\Service\Exception\LLMValidationException On bad input, an unknown provider or an
+ *   unsupported attachment.
+ */
+    protected function _prepare(array $input, array $options): array {
         $options = array_merge($this->boundOptions, $options);
         $actionName = trim($this->boundAction);
         $entry = $this->registry->get($actionName);
@@ -119,32 +219,7 @@ final class LLMService {
             (array)($this->_option('tools', $options, $actionDefaults) ?? [])
         );
 
-        $logContext = ['scope' => ['sage'], 'action' => $actionName, 'provider' => $providerKey, 'model' => $request->model];
-        $started = microtime(true);
-        try {
-            $response = $this->_complete($provider, $request);
-        } catch (LLMException $exception) {
-            Log::write('warning', 'Sage action failed: ' . $exception->getMessage(), $logContext + $exception->context());
-            throw $exception;
-        }
-        $latency = (int)round((microtime(true) - $started) * 1000);
-
-        $json = null;
-        if ($request->wantsJson()) {
-            $context = ['action' => $actionName, 'finish_reason' => $response->finish_reason];
-            if ($response->isTruncated() && JsonOutput::decode($response->text) === null) {
-                throw new LLMValidationException('Model output was truncated (token limit reached); raise max_tokens.', 0, null, $context);
-            }
-            $json = JsonOutput::parse($response->text, $outputSchema ?? [], $context);
-        }
-
-        Log::write('info', 'Sage action completed', $logContext + [
-            'model' => $response->model,
-            'latency_ms' => $latency,
-            'finish_reason' => $response->finish_reason,
-        ] + $response->usage);
-
-        return new LLMResult($actionName, $providerKey, $response->model, $request->output_mode, $response->text, $json, $response->usage, $latency, $response->finish_reason, $response->sources, $response->tool_errors);
+        return [$actionName, $provider, $request, $outputSchema];
     }
 
 /**

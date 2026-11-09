@@ -19,13 +19,16 @@ final class HttpTransportResponse {
  * @param int $status_code HTTP status (0 when the request timed out or never completed).
  * @param array<string, string|array> $headers Response headers.
  * @param string $body Raw body.
- * @param string $error Transport error (cURL message...) when `status_code` is 0.
+ * @param string $error Transport error (cURL message...) when `status_code` is 0, or when a
+ *   streamed transfer did not end cleanly.
+ * @param bool $aborted A callback of a streamed transfer stopped it (StreamingTransportInterface).
  */
     public function __construct(
         public readonly int $status_code,
         public readonly array $headers,
         public readonly string $body,
-        public readonly string $error = ''
+        public readonly string $error = '',
+        public readonly bool $aborted = false
     ) {
     }
 

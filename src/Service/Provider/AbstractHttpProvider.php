@@ -12,6 +12,7 @@ use Sage\Service\Exception\LLMProviderException;
 use Sage\Service\Exception\LLMRateLimitedException;
 use Sage\Service\Exception\LLMTimeoutException;
 use Sage\Service\Transport\HttpTransportInterface;
+use Sage\Service\Transport\HttpTransportResponse;
 
 /**
  * Shared plumbing of the HTTP providers: POST a JSON payload and map failures
@@ -65,6 +66,23 @@ abstract class AbstractHttpProvider implements ProviderInterface {
         }
 
         $data = $response->json();
+        $this->_throwForStatus($response, $data);
+        if ($data === null) {
+            throw new LLMProviderException($this->_name . ' returned a non-JSON response.', 0, null, ['status' => $response->status_code]);
+        }
+        return $data;
+    }
+
+/**
+ * Throw for an HTTP error status (429, and any status of 400 or more).
+ *
+ * @param \Sage\Service\Transport\HttpTransportResponse $response Response.
+ * @param array<string, mixed>|null $data Decoded body.
+ * @return void
+ * @throws \Sage\Service\Exception\LLMRateLimitedException On HTTP 429.
+ * @throws \Sage\Service\Exception\LLMProviderException On other errors.
+ */
+    protected function _throwForStatus(HttpTransportResponse $response, ?array $data): void {
         if ($response->status_code === 429) {
             $retryAfter = $response->header('retry-after');
             throw new LLMRateLimitedException($this->_name . ' rate limited.', 0, null, [
@@ -81,10 +99,6 @@ abstract class AbstractHttpProvider implements ProviderInterface {
                 'retry_after' => $retryAfter !== null ? (int)$retryAfter : null,
             ]);
         }
-        if ($data === null) {
-            throw new LLMProviderException($this->_name . ' returned a non-JSON response.', 0, null, ['status' => $response->status_code]);
-        }
-        return $data;
     }
 
 /**

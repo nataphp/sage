@@ -32,6 +32,7 @@ final class LLMResult {
  * @param string|null $finish_reason Provider's raw stop/finish reason.
  * @param list<array{tool: string, url: string, title?: string, page_age?: string, retrieved_at?: string}> $sources Pages the server tools returned.
  * @param list<array{tool: string, error_code: string}> $tool_errors Server tool calls that failed.
+ * @param int|null $first_token_ms Streams (`Sage::stream()`): milliseconds until the first piece of text.
  */
     public function __construct(
         public readonly string $action,
@@ -44,7 +45,8 @@ final class LLMResult {
         public readonly int $latency_ms,
         public readonly ?string $finish_reason = null,
         public readonly array $sources = [],
-        public readonly array $tool_errors = []
+        public readonly array $tool_errors = [],
+        public readonly ?int $first_token_ms = null
     ) {
     }
 
